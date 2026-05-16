@@ -19,7 +19,7 @@ import type { IEcosystemAdapter } from '../../vscode-extension/src/ecosystemAdap
 import { OpenCodeAdapter, CrushAdapter, ContinueAdapter, ClaudeDesktopAdapter, ClaudeCodeAdapter, VisualStudioAdapter, MistralVibeAdapter, GeminiCliAdapter, CopilotChatAdapter, CopilotCliAdapter, JetBrainsAdapter } from '../../vscode-extension/src/adapters';
 import { isMcpTool, extractMcpServerName } from '../../vscode-extension/src/workspaceHelpers';
 import { parseSessionFileContent } from '../../vscode-extension/src/sessionParser';
-import { estimateTokensFromText, getModelFromRequest, isJsonlContent, estimateTokensFromJsonlSession, calculateEstimatedCost, getModelTier } from '../../vscode-extension/src/tokenEstimation';
+import { estimateTokensFromText, getModelFromRequest, isJsonlContent, estimateTokensFromJsonlSession, calculateEstimatedCost, getModelTier, applyDelta, extractPerRequestUsageFromRawLines } from '../../vscode-extension/src/tokenEstimation';
 import { extractDailyFractions } from '../../vscode-extension/src/dailyAttribution';
 import type { DetailedStats, PeriodStats, ModelUsage, EditorUsage, SessionFileCache, UsageAnalysisStats, UsageAnalysisPeriod, WorkspaceCustomizationMatrix } from '../../vscode-extension/src/types';
 import { analyzeSessionUsage, mergeUsageAnalysis, calculateModelSwitching, trackEnhancedMetrics } from '../../vscode-extension/src/usageAnalysis';
@@ -300,6 +300,19 @@ export interface SessionData {
 	dailyFractions: Record<string, number>;
 }
 
+export interface SessionUsageEntry {
+	file: string;
+	editor: string;
+	time: string;
+	inputTokens: number;
+	outputTokens: number;
+	totalTokens: number;
+	interactions: number;
+	models: string[];
+	estimatedCost: number;
+	estimatedCostCopilot: number;
+}
+
 /**
  * Extract per-UTC-day fractions from session content using interaction timestamps.
  * Fractions sum to 1.0. Falls back to { [fallbackDateKey]: 1.0 } when no timestamps found.
@@ -315,6 +328,295 @@ export interface SessionData {
 /** Returns actual tokens when available (more accurate), else falls back to estimated. */
 export function effectiveTokens(data: SessionData): number {
 	return data.actualTokens > 0 ? data.actualTokens : data.tokens;
+}
+
+function extractInteractionTimestamps(content: string, isJsonl: boolean): number[] {
+	const timestamps: number[] = [];
+
+	const recordTimestamp = (value: unknown): void => {
+		if (value === undefined || value === null) { return; }
+		const ms = new Date(value as any).getTime();
+		if (!Number.isNaN(ms)) {
+			timestamps.push(ms);
+		}
+	};
+
+	if (isJsonl) {
+		const requestTsMap: Record<number, unknown> = {};
+		const lines = content.trim().split('\n');
+		for (const line of lines) {
+			if (!line.trim()) { continue; }
+			try {
+				const event = JSON.parse(line);
+
+				if (event.type === 'user.message') {
+					recordTimestamp(event.timestamp ?? event.ts ?? event.data?.timestamp);
+					continue;
+				}
+
+				const kind = event.kind;
+				const k: unknown[] = event.k;
+				const v = event.v;
+
+				if (kind === 0 && v?.requests && Array.isArray(v.requests)) {
+					for (const req of v.requests) {
+						recordTimestamp(req.timestamp ?? req.ts);
+					}
+				} else if (kind === 2 && Array.isArray(k) && k[0] === 'requests') {
+					if (Array.isArray(v)) {
+						for (const req of v) {
+							recordTimestamp(req.timestamp ?? req.ts);
+						}
+					} else if (v && typeof v === 'object') {
+						const ts = (v as any).timestamp ?? (v as any).ts;
+						recordTimestamp(ts);
+						if (typeof k[1] === 'number') {
+							requestTsMap[k[1]] = ts;
+						}
+					}
+				} else if (kind === 1 && Array.isArray(k) && k.length === 3 && k[0] === 'requests' &&
+						(k[2] === 'timestamp' || k[2] === 'ts') && typeof k[1] === 'number') {
+					const idx = k[1] as number;
+					if (requestTsMap[idx] === undefined) {
+						recordTimestamp(v);
+					}
+					requestTsMap[idx] = v;
+				}
+			} catch {
+				// skip malformed lines
+			}
+		}
+	} else {
+		try {
+			const parsed = JSON.parse(content);
+			if (Array.isArray(parsed.requests)) {
+				for (const req of parsed.requests) {
+					recordTimestamp(req.timestamp ?? req.ts ?? req.result?.timestamp);
+				}
+			}
+		} catch {
+			// skip malformed JSON
+		}
+	}
+
+	return timestamps;
+}
+
+async function resolveSessionTime(filePath: string, fallback: Date): Promise<string> {
+	const eco = _ecosystems.find(e => e.handles(filePath));
+	if (eco) {
+		try {
+			const meta = await eco.getMeta(filePath);
+			if (meta.lastInteraction) { return meta.lastInteraction; }
+			if (meta.firstInteraction) { return meta.firstInteraction; }
+		} catch {
+			// fallback to mtime below
+		}
+		return fallback.toISOString();
+	}
+
+	try {
+		const content = await fs.promises.readFile(filePath, 'utf-8');
+		const isJsonl = filePath.endsWith('.jsonl') || isJsonlContent(content);
+		const timestamps = extractInteractionTimestamps(content, isJsonl);
+		if (timestamps.length > 0) {
+			timestamps.sort((a, b) => a - b);
+			return new Date(timestamps[timestamps.length - 1]).toISOString();
+		}
+	} catch {
+		// fallback to mtime below
+	}
+
+	return fallback.toISOString();
+}
+
+/**
+ * Extract unique model names from a delta-based VS Code JSONL session by reconstructing
+ * the delta state and reading requests[].modelId fields.
+ */
+async function extractDeltaSessionModels(filePath: string): Promise<string[]> {
+	try {
+		const content = await fs.promises.readFile(filePath, 'utf-8');
+		const lines = content.trim().split('\n');
+
+		let sessionState: any = {};
+		let isDeltaBased = false;
+
+		for (const line of lines) {
+			if (!line.trim()) { continue; }
+			try {
+				const event = JSON.parse(line);
+				if (typeof event.kind === 'number') {
+					isDeltaBased = true;
+					sessionState = applyDelta(sessionState, event);
+				}
+			} catch { /* skip malformed lines */ }
+		}
+
+		if (!isDeltaBased) { return []; }
+
+		const requests: any[] = Array.isArray(sessionState.requests) ? sessionState.requests : [];
+		const modelSet = new Set<string>();
+		for (const req of requests) {
+			if (req?.modelId && typeof req.modelId === 'string') {
+				// Strip provider prefix (e.g. "copilot/claude-sonnet-4.6" → "claude-sonnet-4.6")
+				const modelId = req.modelId.includes('/') ? req.modelId.split('/').slice(1).join('/') : req.modelId;
+				if (modelId && modelId !== 'unknown') {
+					modelSet.add(modelId);
+				}
+			}
+		}
+		return Array.from(modelSet);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Extract input (prompt) and output tokens separately from a delta-based VS Code JSONL session.
+ * VS Code sessions use delta format (kind: 0/1/2) where actual token counts are stored in
+ * request.result.promptTokens and request.result.outputTokens. Unlike Copilot CLI sessions
+ * which have session.shutdown with per-model totals, VS Code sessions need reconstruction
+ * of the delta state to access these per-request values.
+ */
+async function extractDeltaSessionTokens(filePath: string): Promise<{ inputTokens: number; outputTokens: number } | null> {
+	try {
+		const content = await fs.promises.readFile(filePath, 'utf-8');
+		const lines = content.trim().split('\n');
+
+		let sessionState: any = {};
+		let isDeltaBased = false;
+
+		for (const line of lines) {
+			if (!line.trim()) { continue; }
+			try {
+				const event = JSON.parse(line);
+				if (typeof event.kind === 'number') {
+					isDeltaBased = true;
+					sessionState = applyDelta(sessionState, event);
+				}
+			} catch { /* skip malformed lines */ }
+		}
+
+		if (!isDeltaBased) { return null; }
+
+		const rawUsageFallback = extractPerRequestUsageFromRawLines(lines);
+		const requests: any[] = Array.isArray(sessionState.requests) ? sessionState.requests : [];
+
+		let inputTokens = 0;
+		let outputTokens = 0;
+
+		const maxIndex = Math.max(requests.length, ...Array.from(rawUsageFallback.keys()).map(k => k + 1), 0);
+		for (let i = 0; i < maxIndex; i++) {
+			const request = requests[i];
+			let found = false;
+			if (request?.result) {
+				const r = request.result;
+				if (typeof r.promptTokens === 'number' && typeof r.outputTokens === 'number') {
+					inputTokens += r.promptTokens;
+					outputTokens += r.outputTokens;
+					found = true;
+				} else if (r.metadata && typeof r.metadata.promptTokens === 'number' && typeof r.metadata.outputTokens === 'number') {
+					inputTokens += r.metadata.promptTokens;
+					outputTokens += r.metadata.outputTokens;
+					found = true;
+				}
+			}
+			if (!found) {
+				const extracted = rawUsageFallback.get(i);
+				if (extracted) {
+					inputTokens += extracted.promptTokens;
+					outputTokens += extracted.outputTokens;
+				}
+			}
+		}
+
+		if (inputTokens === 0 && outputTokens === 0) { return null; }
+		return { inputTokens, outputTokens };
+	} catch {
+		return null;
+	}
+}
+
+export async function calculateTodaySessionUsage(sessionFiles: string[], dateKey = new Date().toISOString().slice(0, 10)): Promise<SessionUsageEntry[]> {
+
+	const results = await runWithConcurrency(sessionFiles, async (file) => {
+		const data = await processSessionFile(file);
+		if (!data) { return null; }
+
+		const fraction = data.dailyFractions[dateKey] ?? 0;
+		if (fraction <= 0) { return null; }
+
+		let inputTokensRaw = Object.values(data.modelUsage).reduce((sum, usage) => sum + usage.inputTokens, 0);
+		let outputTokensRaw = Object.values(data.modelUsage).reduce((sum, usage) => sum + usage.outputTokens, 0);
+
+		// VS Code sessions don't have per-model breakdown (no session.shutdown) — extract
+		// promptTokens/outputTokens directly from the reconstructed delta state.
+		if (inputTokensRaw === 0 && outputTokensRaw === 0 && !_ecosystems.find(e => e.handles(file))) {
+			const deltaTokens = await extractDeltaSessionTokens(file);
+			if (deltaTokens) {
+				inputTokensRaw = deltaTokens.inputTokens;
+				outputTokensRaw = deltaTokens.outputTokens;
+			}
+		}
+
+		const inputTokens = Math.round(inputTokensRaw * fraction);
+		let outputTokens = Math.round(outputTokensRaw * fraction);
+
+		if (inputTokensRaw === 0 && outputTokensRaw === 0) {
+			// Final fallback: source only exposes a total; put it in output column.
+			outputTokens = Math.round(effectiveTokens(data) * fraction);
+		}
+
+		const totalTokens = inputTokens + outputTokens;
+		if (totalTokens <= 0) { return null; }
+		const time = await resolveSessionTime(file, data.lastModified);
+
+		let models = Object.keys(data.modelUsage).filter(m => m && m !== 'unknown');
+
+		// For VS Code delta-based sessions, modelUsage is empty — extract models from raw delta state.
+		if (models.length === 0 && !_ecosystems.find(e => e.handles(file))) {
+			models = await extractDeltaSessionModels(file);
+		}
+
+		const proratedModelUsage = Object.fromEntries(
+			Object.entries(data.modelUsage).map(([model, usage]) => [model, {
+				inputTokens: Math.round(usage.inputTokens * fraction),
+				outputTokens: Math.round(usage.outputTokens * fraction),
+				cachedReadTokens: usage.cachedReadTokens !== undefined ? Math.round(usage.cachedReadTokens * fraction) : undefined,
+				cacheCreationTokens: usage.cacheCreationTokens !== undefined ? Math.round(usage.cacheCreationTokens * fraction) : undefined,
+			}])
+		) as ModelUsage;
+
+		const pricedModels = models.filter((model) => model && model !== 'unknown' && model !== 'auto' && !!modelPricing[model]);
+
+		if (Object.keys(proratedModelUsage).length === 0 && pricedModels.length === 1) {
+			proratedModelUsage[pricedModels[0]] = {
+				inputTokens,
+				outputTokens,
+			};
+		}
+
+		const estimatedCost = calculateEstimatedCost(proratedModelUsage, modelPricing);
+		const estimatedCostCopilot = calculateEstimatedCost(proratedModelUsage, modelPricing, 'copilot');
+
+		return {
+			file,
+			editor: data.editorSource,
+			time,
+			inputTokens,
+			outputTokens,
+			totalTokens,
+			interactions: Math.max(1, Math.round(data.interactions * fraction)),
+			models,
+			estimatedCost,
+			estimatedCostCopilot,
+		} as SessionUsageEntry;
+	});
+
+	return results
+		.filter((entry): entry is SessionUsageEntry => !!entry)
+		.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
 }
 
 /**

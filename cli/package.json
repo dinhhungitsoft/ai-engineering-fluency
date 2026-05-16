@@ -2,6 +2,8 @@
   "name": "@rajbos/ai-engineering-fluency",
   "version": "0.1.3",
   "description": "AI Engineering Fluency - CLI tool to analyze GitHub Copilot token usage from local session files",
+  "main": "dist/api.js",
+  "types": "api.d.ts",
   "license": "MIT",
   "author": "RobBos",
   "repository": {
@@ -19,8 +21,18 @@
   "bin": {
     "ai-engineering-fluency": "dist/cli.js"
   },
+  "exports": {
+    ".": {
+      "types": "./api.d.ts",
+      "require": "./dist/api.js",
+      "default": "./dist/api.js"
+    },
+    "./cli": "./dist/cli.js",
+    "./package.json": "./package.json"
+  },
   "files": [
-    "dist/**/*"
+    "dist/**/*",
+    "api.d.ts"
   ],
   "scripts": {
     "build": "node esbuild.js",

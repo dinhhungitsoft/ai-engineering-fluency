@@ -40,18 +40,13 @@ async function main() {
     console.log("Copied sql-wasm.wasm to dist/");
   }
 
-  const buildOptions = {
-    entryPoints: ["src/cli.ts"],
+  const sharedBuildOptions = {
     bundle: true,
-    outfile: "dist/cli.js",
     format: "cjs",
     platform: "node",
     target: "node18",
     sourcemap: !production,
     minify: production,
-    banner: {
-      js: "#!/usr/bin/env node",
-    },
     external: ["vscode"],
     // The CLI bundles shared sources from ../vscode-extension/src, so tell esbuild
     // to resolve package imports from the CLI's own node_modules as well.
@@ -66,7 +61,21 @@ async function main() {
     logLevel: "info",
   };
 
-  await esbuild.build(buildOptions);
+  await esbuild.build({
+    ...sharedBuildOptions,
+    entryPoints: ["src/cli.ts"],
+    outfile: "dist/cli.js",
+    banner: {
+      js: "#!/usr/bin/env node",
+    },
+  });
+
+  await esbuild.build({
+    ...sharedBuildOptions,
+    entryPoints: ["src/api.ts"],
+    outfile: "dist/api.js",
+  });
+
   console.log(
     `CLI built successfully (${production ? "production" : "development"})`
   );

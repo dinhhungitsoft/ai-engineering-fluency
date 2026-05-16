@@ -172,6 +172,31 @@ Total: 56 files across 3 editors
 
 ---
 
+### `sessions` — Session List By Day
+
+Show session usage for a UTC day as a per-session list with time, tokens, and estimated cost.
+
+```bash
+ai-engineering-fluency sessions
+ai-engineering-fluency sessions --date 2026-05-16
+ai-engineering-fluency sessions --json
+```
+
+Example output:
+
+```
+Session Usage (2026-05-16)
+
+  Time         │ Editor           │ Input      │ Output     │ Total      │ Cost (UBB)   │ Session File
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+  10:22:13 AM  │ vscode           │ 2.1K       │ 4.8K       │ 6.9K       │ $0.0240      │ e7f5....jsonl
+  09:14:07 AM  │ copilot-cli      │ 1.0K       │ 2.4K       │ 3.4K       │ $0.0118      │ 43cc....jsonl
+```
+
+With `--json`, outputs a machine-readable payload with the selected `date`, per-session rows, totals, and `discoveredFiles`.
+
+---
+
 ## Data Sources
 
 The CLI scans the same session files as the [VS Code extension](../vscode-extension/README.md):
